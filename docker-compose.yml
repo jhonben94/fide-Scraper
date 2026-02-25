@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fide
+      POSTGRES_PASSWORD: fide
+      POSTGRES_DB: fide
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fide -d fide"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://fide:fide@db:5432/fide
+      FIDE_XML_URL: https://ratings.fide.com/download/standard_rating_list_xml.zip
+      EXPORT_PATH: /data/exports
+    volumes:
+      - exports:/data/exports
+    depends_on:
+      db:
+        condition: service_healthy
+
+  import:
+    build: .
+    command: python -m scripts.run_import
+    environment:
+      DATABASE_URL: postgresql://fide:fide@db:5432/fide
+      FIDE_XML_URL: https://ratings.fide.com/download/standard_rating_list_xml.zip
+      EXPORT_PATH: /data/exports
+    volumes:
+      - exports:/data/exports
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles:
+      - import
+
+  import_history:
+    build: .
+    command: python -m scripts.run_import_history --months 24
+    environment:
+      DATABASE_URL: postgresql://fide:fide@db:5432/fide
+      FIDE_XML_URL: https://ratings.fide.com/download/standard_rating_list_xml.zip
+      EXPORT_PATH: /data/exports
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles:
+      - import_history
+
+volumes:
+  pgdata:
+  exports:
