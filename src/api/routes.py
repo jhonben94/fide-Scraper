@@ -1,5 +1,9 @@
 """Rutas de la API REST."""
 
+from __future__ import annotations
+
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -24,8 +28,8 @@ def get_db():
 def list_players(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
-    country: str | None = Query(None, min_length=2, max_length=3),
-    min_rating: int | None = Query(None, ge=0, le=3000),
+    country: Optional[str] = Query(None, min_length=2, max_length=3),
+    min_rating: Optional[int] = Query(None, ge=0, le=3000),
     session: Session = Depends(get_db),
 ):
     """
@@ -107,7 +111,7 @@ def get_player_progress_endpoint(
     """
     Evolución del rating en el tiempo (Standard, Rapid, Blitz).
 
-    Requiere haber ejecutado el import de historial: python -m scripts.run_import_history
+    Requiere datos en player_rating_history (p. ej. python -m scripts.run_import_history --current-year --country PAR)
     """
     stmt = select(Player).where(Player.fideid == fideid)
     player = session.scalar(stmt)

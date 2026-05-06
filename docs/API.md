@@ -28,6 +28,97 @@ Verifica que el servicio está disponible.
 
 ---
 
+### Trigger import mensual/base (admin)
+
+```http
+POST /admin/import
+X-API-Key: <secret>
+Content-Type: application/json
+```
+
+Dispara importación en background y devuelve un `job_id`.
+
+Body opcional:
+
+```json
+{
+  "period": "2025-01-01",
+  "export_json": true,
+  "export_csv": true
+}
+```
+
+Respuesta (`202 Accepted`):
+
+```json
+{
+  "job_id": "f6a8b8f0d5834a73b0a8a52fc2f8a53d",
+  "type": "import",
+  "status": "queued"
+}
+```
+
+Errores:
+- `401` API key inválida o ausente
+- `403` IP fuera de allowlist
+- `409` ya hay un import en ejecución
+
+---
+
+### Trigger import histórico (admin)
+
+```http
+POST /admin/import-history
+X-API-Key: <secret>
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "months": 24,
+  "period_scope": "rolling_months",
+  "countries": ["PAR"],
+  "include_club_affiliates": false,
+  "skip_completed": false
+}
+```
+
+- `period_scope`: `rolling_months` (usa `months`) o `current_year` (enero → mes actual del año en curso).
+- `countries`: opcional; lista de códigos FIDE (ej. solo Paraguay: `["PAR"]`). Sin el campo se importan todas las federaciones.
+- `include_club_affiliates`: si es `true`, también incluye jugadores con club asignado (OR con `countries`).
+- `skip_completed`: si es `true`, no vuelve a descargar/parsear periodos ya registrados en `fide.history_import_checkpoint` **para la misma clave de filtro** (`countries`/club o hash de `fide_ids`).
+- `fide_ids`: opcional; lista de FIDE ID enteros (máx. 50000). Si se envía no vacía, **solo** se persisten esos jugadores; **no** debe combinarse con `countries` ni `include_club_affiliates` (la API devuelve error de validación). La clave de checkpoint es estable (`fides:<sha256>` del conjunto ordenado), así que el mismo listado + `skip_completed: true` reanuda sin repetir periodos ya hechos.
+
+Ejemplo solo listado FIDE:
+
+```json
+{
+  "months": 12,
+  "period_scope": "rolling_months",
+  "skip_completed": true,
+  "fide_ids": [123456, 789012]
+}
+```
+
+**Recuperación tras borrar filas en `player_rating_history` o fallos parciales:** el checkpoint puede seguir marcando el periodo como completo. Opciones: ejecutar con `skip_completed: false` para forzar reproceso (los upserts repueblan huecos), o borrar las filas correspondientes en `fide.history_import_checkpoint` para ese `filter_key` (ver campo `filter_key` en la respuesta del job) y volver a lanzar con `skip_completed: true`.
+
+Respuesta (`202 Accepted`): igual formato que `/admin/import`, con `"type": "import-history"`.
+
+---
+
+### Estado de job (admin)
+
+```http
+GET /admin/jobs/{job_id}
+X-API-Key: <secret>
+```
+
+Devuelve estado del job: `queued`, `running`, `success` o `failed`.
+
+---
+
 ### Listar jugadores
 
 ```http
@@ -169,7 +260,7 @@ Ejemplo de cálculo FIDE: puntuación esperada, K-factor y cambio de rating para
 GET /players/{fideid}/progress?months=24
 ```
 
-Serie temporal de ratings (Standard, Rapid, Blitz). Requiere ejecutar `python -m scripts.run_import_history` previamente.
+Serie temporal de ratings (Standard, Rapid, Blitz). Requiere datos en `fide.player_rating_history` (p. ej. `python -m scripts.run_import_history --current-year --country PAR`).
 
 **Parámetros**
 

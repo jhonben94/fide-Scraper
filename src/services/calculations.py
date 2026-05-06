@@ -6,6 +6,8 @@ Fórmulas basadas en FIDE Rating Regulations (Handbook).
 - Cambio: ΔR = K × (Score - ExpectedScore)
 """
 
+from __future__ import annotations
+
 import math
 from datetime import date
 

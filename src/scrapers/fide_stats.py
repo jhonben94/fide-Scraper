@@ -4,6 +4,8 @@ La API interna de FIDE expone datos en /a_data_stats.php.
 No es documentada oficialmente; usar con moderación.
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Any
 

@@ -1,62 +1,72 @@
-services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: fide
-      POSTGRES_PASSWORD: fide
-      POSTGRES_DB: fide
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fide -d fide"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+# Misma PostgreSQL que SquareOne (DB `clubsync`, esquema `fide` — Flyway V6 del backend).
+#
+# Desde la raíz del monorepo (recomendado, API + Postgres en un solo proyecto):
+#   docker compose up -d postgres fide-scraper
+#
+# Solo desde esta carpeta: primero en la raíz `docker compose up -d postgres`, luego aquí:
+#   docker compose up -d app
+#   docker compose --profile fide-import run --rm import
+#   docker compose --profile fide-import-history run --rm import_history
+#
+# La red `squareone_default` la crea el compose raíz (top-level `name: squareone`).
 
+networks:
+  squareone:
+    name: squareone_default
+    external: true
+
+services:
   app:
     build: .
+    image: ${IMAGE_FIDE_SCRAPER:-jhonybenitez/squareone-fide-scraper:1.0.0}
     ports:
       - "8000:8000"
+    networks: [squareone]
     environment:
-      DATABASE_URL: postgresql://fide:fide@db:5432/fide
-      FIDE_XML_URL: https://ratings.fide.com/download/standard_rating_list_xml.zip
+      DATABASE_URL: postgresql://clubsync:clubsync@postgres:5432/clubsync
+      FIDE_XML_URL: https://ratings.fide.com/download/players_list_xml.zip
       EXPORT_PATH: /data/exports
     volumes:
       - exports:/data/exports
-    depends_on:
-      db:
-        condition: service_healthy
 
   import:
     build: .
-    command: python -m scripts.run_import
+    image: ${IMAGE_FIDE_SCRAPER:-jhonybenitez/squareone-fide-scraper:1.0.0}
+    command: ["python", "-m", "scripts.run_import"]
+    networks: [squareone]
     environment:
-      DATABASE_URL: postgresql://fide:fide@db:5432/fide
-      FIDE_XML_URL: https://ratings.fide.com/download/standard_rating_list_xml.zip
+      DATABASE_URL: postgresql://clubsync:clubsync@postgres:5432/clubsync
+      FIDE_XML_URL: https://ratings.fide.com/download/players_list_xml.zip
       EXPORT_PATH: /data/exports
     volumes:
       - exports:/data/exports
-    depends_on:
-      db:
-        condition: service_healthy
     profiles:
-      - import
+      - fide-import
 
   import_history:
     build: .
-    command: python -m scripts.run_import_history --months 24
+    image: ${IMAGE_FIDE_SCRAPER:-jhonybenitez/squareone-fide-scraper:1.0.0}
+    command:
+      [
+        "python",
+        "-m",
+        "scripts.run_import_history",
+        "--current-year",
+        "--country",
+        "PAR",
+      ]
+    networks: [squareone]
     environment:
-      DATABASE_URL: postgresql://fide:fide@db:5432/fide
-      FIDE_XML_URL: https://ratings.fide.com/download/standard_rating_list_xml.zip
+      DATABASE_URL: postgresql://clubsync:clubsync@postgres:5432/clubsync
+      FIDE_XML_URL: https://ratings.fide.com/download/players_list_xml.zip
       EXPORT_PATH: /data/exports
-    depends_on:
-      db:
-        condition: service_healthy
+      # Opcional: mismo efecto que los flags del command (útil si sobrescribís command)
+      FIDE_HISTORY_PERIOD_SCOPE: current_year
+      FIDE_HISTORY_COUNTRY_CODES: PAR
+    volumes:
+      - exports:/data/exports
     profiles:
-      - import_history
+      - fide-import-history
 
 volumes:
-  pgdata:
   exports:

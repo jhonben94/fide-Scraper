@@ -1,17 +1,19 @@
 """Orquestador del pipeline: descarga, parseo, importación a DB y exportación."""
 
+from __future__ import annotations
+
 import logging
 from collections.abc import Iterator
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from src.database import get_db_session, get_engine, init_db
-from src.downloader import download_fide_xml
+from src.downloader import extracted_xml_tempfile
 from src.exporter import export_to_csv, export_to_json
 from src.models import Player
-from src.parser import parse_players_xml
+from src.parser import parse_players_xml_path
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,7 @@ def _batch_upsert(session: Session, batch: list[dict]) -> int:
             "flag": stmt.excluded.flag,
             "foa_title": stmt.excluded.foa_title,
             "foa_rating": stmt.excluded.foa_rating,
+            "updated_at": func.now(),
         },
     )
     session.execute(stmt)
@@ -85,6 +88,7 @@ def run_import(
     period: str | None = None,
     export_json: bool = True,
     export_csv: bool = True,
+    fide_ids: frozenset[int] | None = None,
 ) -> dict:
     """
     Ejecuta el pipeline completo: descarga -> parse -> DB -> export.
@@ -93,33 +97,53 @@ def run_import(
         period: Fecha opcional YYYY-MM-DD para listas históricas.
         export_json: Si True, exporta a JSON.
         export_csv: Si True, exporta a CSV.
+        fide_ids: Si se define, solo se hace upsert de estos FIDE ID (el XML completo se sigue
+            parseando en streaming; útil para API / import puntual).
 
     Returns:
-        Diccionario con estadísticas: total_imported, json_path, csv_path.
+        Diccionario con estadísticas: total_imported, total_parsed_rows, json_path, csv_path.
     """
-    logger.info("Iniciando importación FIDE (period=%s)", period)
+    logger.info(
+        "Iniciando importación FIDE (period=%s, fide_ids=%s)",
+        period,
+        f"solo {len(fide_ids)} id(s)" if fide_ids else "todos",
+    )
 
-    # 1. Descargar XML
-    xml_content = download_fide_xml(period=period)
-
-    # 2. Inicializar DB
     engine = get_engine()
     init_db(engine)
 
-    total = 0
-    with get_db_session() as session:
-        for batch in _batched(parse_players_xml(xml_content), BATCH_SIZE):
-            _batch_upsert(session, batch)
-            total += len(batch)
-            if total % 50000 == 0 or total < 10000:
-                logger.info("Importados %d jugadores...", total)
+    parsed_rows = 0
+    upserted = 0
+    with extracted_xml_tempfile(period=period) as xml_path:
+        with get_db_session() as session:
+            for batch in _batched(parse_players_xml_path(xml_path), BATCH_SIZE):
+                parsed_rows += len(batch)
+                if fide_ids:
+                    batch = [p for p in batch if int(p.get("fideid", 0)) in fide_ids]
+                if not batch:
+                    continue
+                _batch_upsert(session, batch)
+                upserted += len(batch)
+                if not fide_ids and (upserted % 50000 == 0 or upserted < 10000):
+                    logger.info("Importados %d jugadores...", upserted)
+                elif fide_ids and upserted and upserted % 1000 == 0:
+                    logger.info("Importados %d filas (filtro FIDE)...", upserted)
 
-    result: dict = {"total_imported": total}
+    result: dict = {
+        "total_imported": upserted,
+        "total_parsed_rows": parsed_rows,
+        "fide_ids_mode": bool(fide_ids),
+        "fide_id_count": len(fide_ids) if fide_ids else None,
+    }
 
-    # 3. Exportar desde DB (streaming para evitar memoria)
+    # Exportar solo los jugadores solicitados si hay filtro; si no, primeros EXPORT_LIMIT.
     if export_json or export_csv:
         with get_db_session() as session:
-            stmt = select(Player).limit(EXPORT_LIMIT)
+            if fide_ids:
+                ids_list = list(fide_ids)
+                stmt = select(Player).where(Player.fideid.in_(ids_list))
+            else:
+                stmt = select(Player).limit(EXPORT_LIMIT)
             players = [p.to_dict() for p in session.scalars(stmt).all()]
             if players:
                 if export_json:
@@ -127,5 +151,5 @@ def run_import(
                 if export_csv:
                     result["csv_path"] = str(export_to_csv(players))
 
-    logger.info("Importación completada: %d jugadores", total)
+    logger.info("Importación completada: %d upserts (%d filas parseadas)", upserted, parsed_rows)
     return result

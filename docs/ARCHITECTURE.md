@@ -38,17 +38,17 @@ flowchart TB
 
 ### 1. Downloader (`src/downloader.py`)
 
-- Descarga el archivo ZIP desde [FIDE Download](https://ratings.fide.com/download_lists.phtml). Por defecto usa `standard_rating_list_xml.zip` (~13 MB)
-- Soporta listas históricas con el parámetro `?period=YYYY-MM-DD`
-- Descomprime en memoria y retorna el contenido XML
-- Usa `httpx` con timeout de 120 segundos
+- Descarga el ZIP desde [FIDE Download](https://ratings.fide.com/download_lists.phtml); por defecto lista **combinada** `players_list_xml.zip` (STD+RPD+BLZ, ~48 MB), la misma familia que el enlace “Combined list … XML” en la web FIDE. El ZIP `*_foa.zip` es otro artefacto (menor tamaño) y puede no coincidir con los ratings públicos del buscador.
+- Soporta listas históricas con `?period=YYYY-MM-DD`.
+- **Streaming a disco**: `httpx` escribe el ZIP en un temporal; el primer `.xml` del ZIP se extrae a otro temporal con `shutil.copyfileobj` (sin cargar el XML completo en RAM). El context manager `extracted_xml_tempfile` borra ambos al terminar.
+- `download_fide_xml()` sigue existiendo como legado (lee el XML entero a bytes) y no se usa en el importador principal.
 
 ### 2. Parser (`src/parser.py`)
 
-- Parsea el XML con `xml.etree.ElementTree.iterparse` para streaming
-- Genera diccionarios por jugador sin cargar todo en memoria
-- Maneja namespaces XML si FIDE los utiliza
-- Campos extraídos: `fideid`, `name`, `country`, `sex`, `title`, `rating`, `games`, `rapid_rating`, `blitz_rating`, `birthday`, etc.
+- `ET.iterparse` en evento `end` solo para elementos `<player>`; tras procesar cada jugador se hace `elem.clear()` para liberar memoria (no se hace `clear` en hijos antes del `end` de `player`, para no romper el árbol).
+- `parse_players_xml_path` / `parse_players_xml_stream` leen desde ruta o stream binario; el importador parsea desde archivo en disco.
+- Maneja namespaces por nombre local del tag.
+- Campos extraídos: `fideid`, `name`, `country`, `sex`, `title`, `rating`, `games`, `rapid_rating`, `blitz_rating`, `birthday`, `foa_title`, etc.
 
 ### 3. Base de datos
 - **PostgreSQL 16** con modelo `Player`
@@ -70,8 +70,9 @@ flowchart TB
 ### 6. API REST (`src/api/`)
 
 - FastAPI con documentación automática en `/docs`
-- Endpoints: `/health`, `/players`, `/players/{fideid}`
+- Endpoints: `/health`, `/players`, `/players/{fideid}`, progress, stats, etc.
 - Filtros: paginación, país, rating mínimo
+- Si `FIDE_SCRAPER_API_KEY` está definida, las rutas bajo `/players` exigen header `X-API-Key`; `GET /health` permanece público
 
 ## Estructura del proyecto
 
@@ -87,6 +88,7 @@ fide-Scraper/
 │   ├── exporter.py     # Export JSON/CSV
 │   └── api/
 │       ├── main.py     # FastAPI app
+│       ├── deps.py     # API key opcional
 │       └── routes.py   # Rutas
 ├── scripts/
 │   └── run_import.py   # CLI importación

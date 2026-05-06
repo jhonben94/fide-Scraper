@@ -1,7 +1,6 @@
-"""Migración: añade columna foa_title a la tabla players.
+"""Migración legacy: añade columnas FOA en fide.players (Flyway V6 ya las incluye).
 
 Ejecutar: python -m scripts.migrate_add_foa_title
-O con Docker: docker compose run --rm app python -m scripts.migrate_add_foa_title
 """
 import logging
 import sys
@@ -19,11 +18,15 @@ def run():
     with engine.connect() as conn:
         # PostgreSQL: ADD COLUMN IF NOT EXISTS (desde PG 9.6)
         conn.execute(text("""
-            ALTER TABLE players
+            ALTER TABLE fide.players
             ADD COLUMN IF NOT EXISTS foa_title VARCHAR(50)
         """))
+        conn.execute(text("""
+            ALTER TABLE fide.players
+            ADD COLUMN IF NOT EXISTS foa_rating INTEGER
+        """))
         conn.commit()
-    logger.info("Migración completada: columna foa_title añadida (o ya existía)")
+    logger.info("Migración completada: fide.players foa_title / foa_rating (o ya existían)")
 
 
 if __name__ == "__main__":

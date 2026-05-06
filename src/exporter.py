@@ -1,5 +1,7 @@
 """Exportación de datos de jugadores a JSON y CSV."""
 
+from __future__ import annotations
+
 import csv
 import json
 import logging

@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.config import get_settings
@@ -18,6 +18,7 @@ def get_engine():
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,
+        connect_args={"application_name": settings.fide_scraper_pg_application_name},
     )
 
 
@@ -28,9 +29,11 @@ def get_session_factory():
 
 
 def init_db(engine=None):
-    """Inicializa las tablas en la base de datos."""
+    """Inicializa esquema `fide` (si falta) y las tablas en la base de datos."""
     if engine is None:
         engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS fide"))
     Base.metadata.create_all(bind=engine)
 
 

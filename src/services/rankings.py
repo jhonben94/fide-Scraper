@@ -1,5 +1,7 @@
 """Cálculo de rankings mundial, nacional y continental."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
