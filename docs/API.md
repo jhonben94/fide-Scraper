@@ -44,9 +44,12 @@ Body opcional:
 {
   "period": "2025-01-01",
   "export_json": true,
-  "export_csv": true
+  "export_csv": true,
+  "countries": ["PAR"]
 }
 ```
+
+- `countries`: opcional; lista de códigos FIDE (ej. solo Paraguay: `["PAR"]`). Sin el campo se importan todas las federaciones. No combinar con `fide_ids`.
 
 Respuesta (`202 Accepted`):
 

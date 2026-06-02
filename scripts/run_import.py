@@ -4,6 +4,7 @@ import argparse
 import logging
 import sys
 
+from src.config import get_settings
 from src.importer import run_import
 
 logging.basicConfig(
@@ -22,6 +23,13 @@ def main():
         help="Fecha en formato YYYY-MM-DD para listas históricas",
     )
     parser.add_argument(
+        "--country",
+        action="append",
+        dest="countries",
+        metavar="CODE",
+        help="Código federación FIDE (repetible), ej. --country PAR. Sin esto: todo el mundo",
+    )
+    parser.add_argument(
         "--no-json",
         action="store_true",
         help="No exportar a JSON",
@@ -33,11 +41,23 @@ def main():
     )
     args = parser.parse_args()
 
+    settings = get_settings()
+    countries = args.countries
+    if not countries and settings.fide_history_country_codes:
+        countries = [
+            c.strip().upper()
+            for c in settings.fide_history_country_codes.split(",")
+            if c.strip()
+        ]
+
+    codes = frozenset(countries) if countries else None
+
     try:
         result = run_import(
             period=args.period,
             export_json=not args.no_json,
             export_csv=not args.no_csv,
+            country_codes=codes,
         )
         logger.info("Resultado: %s", result)
     except Exception as e:

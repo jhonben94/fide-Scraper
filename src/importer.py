@@ -72,6 +72,19 @@ def _batch_upsert(session: Session, batch: list[dict]) -> int:
     return len(batch)
 
 
+def _normalize_country_codes(codes: frozenset[str] | None) -> frozenset[str] | None:
+    if not codes:
+        return None
+    out = frozenset(c.strip().upper() for c in codes if c and str(c).strip())
+    return out or None
+
+
+def _player_matches_country(player: dict, country_codes: frozenset[str] | None) -> bool:
+    if not country_codes:
+        return True
+    return (player.get("country") or "").strip().upper() in country_codes
+
+
 def _batched(iterator: Iterator[dict], size: int) -> Iterator[list[dict]]:
     """Agrupa un iterador en batches del tamaño indicado."""
     batch: list[dict] = []
@@ -89,6 +102,7 @@ def run_import(
     export_json: bool = True,
     export_csv: bool = True,
     fide_ids: frozenset[int] | None = None,
+    country_codes: frozenset[str] | None = None,
 ) -> dict:
     """
     Ejecuta el pipeline completo: descarga -> parse -> DB -> export.
@@ -99,14 +113,18 @@ def run_import(
         export_csv: Si True, exporta a CSV.
         fide_ids: Si se define, solo se hace upsert de estos FIDE ID (el XML completo se sigue
             parseando en streaming; útil para API / import puntual).
+        country_codes: Si se define (p. ej. ``frozenset({"PAR"})``), solo se persisten esas
+            federaciones FIDE. El XML completo se sigue parseando en streaming.
 
     Returns:
         Diccionario con estadísticas: total_imported, total_parsed_rows, json_path, csv_path.
     """
+    codes = None if fide_ids else _normalize_country_codes(country_codes)
     logger.info(
-        "Iniciando importación FIDE (period=%s, fide_ids=%s)",
+        "Iniciando importación FIDE (period=%s, fide_ids=%s, countries=%s)",
         period,
         f"solo {len(fide_ids)} id(s)" if fide_ids else "todos",
+        sorted(codes) if codes else "todas",
     )
 
     engine = get_engine()
@@ -120,6 +138,8 @@ def run_import(
                 parsed_rows += len(batch)
                 if fide_ids:
                     batch = [p for p in batch if int(p.get("fideid", 0)) in fide_ids]
+                elif codes:
+                    batch = [p for p in batch if _player_matches_country(p, codes)]
                 if not batch:
                     continue
                 _batch_upsert(session, batch)
@@ -134,6 +154,7 @@ def run_import(
         "total_parsed_rows": parsed_rows,
         "fide_ids_mode": bool(fide_ids),
         "fide_id_count": len(fide_ids) if fide_ids else None,
+        "country_codes": sorted(codes) if codes else None,
     }
 
     # Exportar solo los jugadores solicitados si hay filtro; si no, primeros EXPORT_LIMIT.
@@ -142,6 +163,12 @@ def run_import(
             if fide_ids:
                 ids_list = list(fide_ids)
                 stmt = select(Player).where(Player.fideid.in_(ids_list))
+            elif codes:
+                stmt = (
+                    select(Player)
+                    .where(func.upper(Player.country).in_(codes))
+                    .limit(EXPORT_LIMIT)
+                )
             else:
                 stmt = select(Player).limit(EXPORT_LIMIT)
             players = [p.to_dict() for p in session.scalars(stmt).all()]

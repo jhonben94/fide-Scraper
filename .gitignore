@@ -144,6 +144,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# CodeGraph local index
+.codegraph/
+
 # Spyder project settings
 .spyderproject
 .spyproject

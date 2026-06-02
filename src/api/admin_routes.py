@@ -35,6 +35,10 @@ class ImportRequest(BaseModel):
     )
     export_json: bool = Field(default=True, description="Exportar salida JSON (solo filas importadas si usás fide_ids)")
     export_csv: bool = Field(default=True, description="Exportar salida CSV (solo filas importadas si usás fide_ids)")
+    countries: Optional[list[str]] = Field(
+        default=None,
+        description="Códigos federación FIDE (ej. PAR); solo esos jugadores se persisten en fide.players",
+    )
     fide_ids: Optional[list[int]] = Field(
         default=None,
         max_length=_MAX_FIDE_IDS_PER_REQUEST,
@@ -58,6 +62,12 @@ class ImportRequest(BaseModel):
             if x is None or int(x) <= 0:
                 raise ValueError("fide_ids debe contener enteros positivos")
         return v
+
+    @model_validator(mode="after")
+    def _exclusive_fide_list_mode(self):
+        if self.fide_ids and self.countries:
+            raise ValueError("No combinar fide_ids con countries")
+        return self
 
 
 class ImportModalityFlagsRequest(BaseModel):
@@ -182,11 +192,16 @@ def _run_job(job_id: str) -> None:
             fid_catalog: frozenset[int] | None = None
             if raw_catalog:
                 fid_catalog = frozenset(int(x) for x in raw_catalog if x is not None)
+            raw_countries = req.get("countries")
+            codes = None
+            if raw_countries and not fid_catalog:
+                codes = frozenset(str(c).strip().upper() for c in raw_countries if str(c).strip())
             result = run_import(
                 period=req.get("period"),
                 export_json=bool(req.get("export_json", True)),
                 export_csv=bool(req.get("export_csv", True)),
                 fide_ids=fid_catalog,
+                country_codes=codes,
             )
         elif job["type"] == "import-history":
             req = job["request"]
@@ -241,6 +256,7 @@ def trigger_import(payload: ImportRequest, background_tasks: BackgroundTasks):
             "period": payload.period,
             "export_json": payload.export_json,
             "export_csv": payload.export_csv,
+            "countries": payload.countries,
             "fide_ids": payload.fide_ids,
         },
     )

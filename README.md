@@ -1,12 +1,73 @@
-# fide-Scraper
+# FIDE Scraper
 
-Scraper que descarga los datos oficiales XML de la [FIDE](https://www.fide.com/) (Federación Internacional de Ajedrez), los procesa, los almacena en PostgreSQL y permite exportación a JSON/CSV. Dockerizado para despliegue en producción.
+Scraper que descarga los datos oficiales XML de la [FIDE](https://www.fide.com/) (Federación Internacional de Ajedrez), los procesa, los almacena en PostgreSQL (esquema `fide`) y expone una API REST con capacidades de exportación. Dockerizado para despliegue en producción.
 
-**Documentación completa**: [docs/](docs/README.md)
+## Stack
+
+| Capa | Tecnología | Versión |
+|------|-----------|---------|
+| Lenguaje | Python | 3.12 |
+| API | FastAPI | >=0.115.0 |
+| ASGI | Uvicorn | >=0.32.0 |
+| ORM/Toolkit | SQLAlchemy | >=2.0.0 |
+| Base de datos | PostgreSQL | 16 |
+| HTTP Client | httpx | >=0.27.0 |
+| Validación | Pydantic | >=2.0.0 |
+| Settings | pydantic-settings | >=2.0.0 |
+
+## Features
+
+### 1. Importación Base Mensual
+Descarga el ZIP XML combinado de FIDE (~48MB), parseo streaming con `iterparse`, batch upsert de 5000 registros en `fide.players`. Soporta importación selectiva por FIDE ID (hasta 50,000). Exportación automática a JSON/CSV (hasta 100K jugadores).
+
+**CLI**: `python -m scripts.run_import [--period YYYY-MM-DD] [--no-json] [--no-csv]`
+
+### 2. Importación Histórica de Ratings
+Descarga archives ZIP por periodo (standard + rapid + blitz por separado), three-pass upsert con `COALESCE` para merge de modalidades. Scopes: `--current-year` (año calendario), `--months N` (rolling window). Filtros: `--country PAR`, `--include-club-affiliates`, `--fide-id`, `--fide-ids-file`. Checkpoint en `history_import_checkpoint` para resume con `--skip-completed`. FIDE ID lists usan SHA-256 como checkpoint key estable.
+
+**CLI**: `python -m scripts.run_import_history --current-year --country PAR [--skip-completed]`
+
+### 3. Import de Flags por Modalidad
+Descarga los 3 ZIPs por modalidad para un periodo, extrae `flag` por jugador, batch-update de columnas `flag_std`, `flag_rpd`, `flag_blz` vía `UPDATE ... FROM unnest()`. Auto-resuelve periodo desde `MAX(period)`.
+
+### 4. API REST - Jugadores
+
+| Endpoint | Descripción |
+|----------|-------------|
+| `GET /health` | Health check (siempre público) |
+| `GET /players` | Lista paginada con filtros (country, min_rating) |
+| `GET /players/{fideid}` | Perfil completo con rankings (mundial/nacional/continental, activos/todos) |
+| `GET /players/{fideid}/calculations?opponent_rating=1800` | Cálculos ELO: expected score, K-factor, rating change |
+| `GET /players/{fideid}/progress?months=24` | Evolución del rating (Std/Rpd/Blz) en el tiempo |
+| `GET /players/{fideid}/stats` | Estadísticas W/D/L por color (Total, Std, Rpd, Blz) - live desde FIDE |
+
+Con `FIDE_SCRAPER_API_KEY` en `.env`, rutas `/players/*` exigen header `X-API-Key`.
+
+### 5. API REST - Admin
+
+| Endpoint | Descripción |
+|----------|-------------|
+| `POST /admin/import` | Trigger importación base (background job) |
+| `POST /admin/import-history` | Trigger importación histórica (background job) |
+| `POST /admin/import-modality-flags` | Trigger import de flags (background job) |
+| `GET /admin/jobs/{job_id}` | Estado del job (queued/running/success/failed) |
+
+Requiere API key + IP/CIDR allowlist (`FIDE_SCRAPER_ADMIN_ALLOWLIST`). Single-job concurrency guard (409 si ya hay un job corriendo).
+
+### 6. Exportación de Datos
+- **JSON**: Archivo timestamped con todos los campos del jugador
+- **CSV**: Archivo timestamped
+- **Por país**: Archivos JSON separados por federación en `by_country/`
+- Máximo 100,000 jugadores por export
+
+### Cálculos de Rating (Regulaciones FIDE)
+- **Expected Score**: `E = 1 / (1 + 10^((Rb-Ra)/400))`
+- **K-Factor**: K=40 (nuevos <30 partidas, o U18 con rating <2300), K=20 (rating <2400 con >=30 partidas), K=10 (rating >=2400 con >=30 partidas)
+- **Rating Change**: `delta_R = K * (Score - ExpectedScore)`
 
 ## Requisitos
 
-- Python 3.9+ (recomendado 3.12+; en macOS, `python3` del sistema suele ser 3.9: usá `python3.12` o un venv si podés)
+- Python 3.9+ (recomendado 3.12+)
 - PostgreSQL 16 (o usar Docker)
 
 ## Instalación local
@@ -14,156 +75,104 @@ Scraper que descarga los datos oficiales XML de la [FIDE](https://www.fide.com/)
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# Editar .env con tu DATABASE_URL
+# Editar .env con DATABASE_URL
 ```
 
-## Uso con Docker
+## Arranque rápido
 
-Los datos van a la **misma PostgreSQL que el backend** (base `clubsync`, esquema `fide`).
-
-### Desde la raíz del monorepo (recomendado)
+### Con Docker (desde raíz del monorepo)
 
 ```bash
-# directorio raíz del repo (donde está docker-compose.yml)
 docker compose up -d postgres fide-scraper
 ```
 
-La API queda en `http://localhost:8000` y `docs` en `/docs`.
+API en `http://localhost:8000`, docs en `/docs`.
 
-### Solo desde `fide-Scraper/` (red compartida)
-
-Antes: en la raíz, `docker compose up -d postgres`. Luego:
+### Solo desde fide-Scraper/ (red compartida)
 
 ```bash
+# Primero levantar postgres desde la raíz
 docker compose build
 docker compose up -d app
 docker compose --profile fide-import run --rm import
 ```
 
-**Importante**: Ejecutá `docker compose build` antes del primer import para que la imagen tenga el código actualizado.
-
 ### Importación manual (sin Docker)
 
 ```bash
 python -m scripts.run_import
-```
-
-Opciones:
-
-- `--period YYYY-MM-DD`: Lista histórica de esa fecha
-- `--no-json`: No exportar a JSON
-- `--no-csv`: No exportar a CSV
-
-### Importar historial (para Progress)
-
-**Importante:** Ejecuta `docker compose build` antes si acabas de añadir o modificar archivos.
-
-El perfil `import_history` en `docker-compose.yml` usa por defecto **año calendario en curso** y solo federación **PAR** (menos filas en `fide.player_rating_history`). El XML mundial se sigue descargando y parseando; el ahorro es en escrituras a PostgreSQL.
-
-```bash
-# Reconstruir imagen (necesario si run_import_history es nuevo)
-docker compose build
-
-# Desde la raíz del monorepo:
-docker compose --profile fide-import-history run --rm fide-import-history
-
-# Desde fide-Scraper/ (con Postgres del compose raíz ya levantado):
-docker compose --profile fide-import-history run --rm import_history
-
-# Equivalente manual (SquareOne / Paraguay):
 python -m scripts.run_import_history --current-year --country PAR
-
-# Paraguay o afiliados a club local:
-python -m scripts.run_import_history --current-year --country PAR --include-club-affiliates
-
-# Reanudar sin repetir meses ya checkpointados (requiere Flyway V8):
-python -m scripts.run_import_history --current-year --country PAR --skip-completed
-
-# Solo un listado de FIDE ID (hash estable en checkpoint; no combinar con --country):
-python -m scripts.run_import_history --months 24 --fide-id 123456 --fide-id 789012 --skip-completed
-
-# Listado desde archivo (un ID por línea, # comentarios):
-python -m scripts.run_import_history --months 24 --fide-ids-file ./mis_ids.txt
-
-# Ventana rolling (ej. 12 meses), todo el mundo:
-python -m scripts.run_import_history --months 12 --period-scope rolling_months
-
-# Defaults desde .env: FIDE_HISTORY_PERIOD_SCOPE, FIDE_HISTORY_COUNTRY_CODES, FIDE_HISTORY_INCLUDE_CLUB_AFFILIATES
 ```
 
-**Control de meses ya ejecutados:** tras aplicar migración Flyway `V8` (tabla `fide.history_import_checkpoint`), cada periodo importado con éxito queda registrado. Podés usar `--skip-completed` para reanudar sin repetir meses listos. Para modo `fide_ids`, la columna `country_filter` almacena una clave tipo `fides:<sha256>` (Flyway `V9` amplía el campo a VARCHAR(128)).
-
-| Situación | Qué hacer |
-|-----------|-----------|
-| Primera corrida o mismo listado, sin checkpoint previo | `skip_completed` opcional |
-| Reanudar import del **mismo** conjunto de FIDE ID o mismas federaciones | `skip_completed: true` |
-| Borraste filas en `player_rating_history` y el checkpoint sigue marcando el periodo | `skip_completed: false` **o** borrar filas en `history_import_checkpoint` para ese `filter_key` |
-
-**Si el portal no muestra el gráfico de historial:** el backend solo lee `fide.player_rating_history` (esquema `fide`). Si tus filas quedaron en `public.player_rating_history` por un cliente SQL incorrecto, movélas o reimportá contra la misma base que usa Quarkus.
-
-**Retención (una vez, si ya importaste años viejos):** borrar periodos anteriores al 1 de enero del año en curso y opcionalmente vaciar/analizar:
-
-```sql
-DELETE FROM fide.player_rating_history
-WHERE period < date_trunc('year', CURRENT_DATE)::date;
--- Opcional tras borrados masivos:
--- VACUUM ANALYZE fide.player_rating_history;
-```
-
-## API REST
-
-| Endpoint | Descripción |
-|----------|-------------|
-| `GET /health` | Health check |
-| `GET /players` | Lista jugadores (paginación, filtros) |
-| `GET /players/{fideid}` | Perfil completo (datos, rankings, foa_title) |
-| `GET /players/{fideid}/calculations?opponent_rating=1800` | Cálculos de rating (K-factor, puntuación esperada) |
-| `GET /players/{fideid}/progress?months=24` | Evolución del rating en el tiempo |
-| `GET /players/{fideid}/stats` | Estadísticas W/D/L por color (Total, Standard, Rapid, Blitz) |
-
-Con `FIDE_SCRAPER_API_KEY` en `.env`, las rutas `/players/*` exigen header `X-API-Key`; `GET /health` sigue público. Ver [.env.example](.env.example).
-
-**Progress** requiere datos en `fide.player_rating_history`. Recomendado para este producto: `python -m scripts.run_import_history --current-year --country PAR`
-
-Parámetros de `GET /players`:
-
-- `skip`, `limit`: Paginación
-- `country`: Código federación (ej: ESP, USA)
-- `min_rating`: Rating mínimo
-
-## Estructura del proyecto
+## Estructura
 
 ```
 fide-Scraper/
 ├── src/
-│   ├── config.py       # Configuración
-│   ├── downloader.py   # Descarga XML FIDE
-│   ├── parser.py      # Parseo XML
-│   ├── models.py      # Modelo Player
-│   ├── database.py    # Conexión DB
-│   ├── importer.py    # Pipeline completo
-│   ├── exporter.py    # Export JSON/CSV
-│   ├── data/          # Mapeos (país-continente)
-│   ├── services/      # Rankings, calculations, progress
-│   ├── scrapers/      # Cliente API estadísticas FIDE
-│   └── api/           # FastAPI (deps.py: API key opcional)
+│   ├── config.py              # Pydantic-settings desde .env
+│   ├── downloader.py          # Descarga streaming ZIP + extracción XML
+│   ├── parser.py              # iterparse streaming XML
+│   ├── models.py              # SQLAlchemy models (Player, RatingHistory, Checkpoint)
+│   ├── database.py            # Engine + connection pooling
+│   ├── importer.py            # Pipeline base (download -> parse -> upsert -> export)
+│   ├── importer_history.py    # Pipeline histórico (multi-period, three-pass)
+│   ├── importer_modality_flags.py  # Import flags por modalidad
+│   ├── exporter.py            # JSON/CSV/per-country export
+│   ├── data/                  # Mapeos (country_continent.json)
+│   ├── services/              # Rankings, calculations, progress
+│   ├── scrapers/              # FIDE stats scraper
+│   └── api/                   # FastAPI (routes, admin_routes, deps, main)
 ├── scripts/
-│   ├── run_import.py       # CLI importación
-│   └── run_import_history.py  # Import historial (Progress)
-├── Dockerfile
-├── docker-compose.yml
+│   ├── run_import.py          # CLI importación base
+│   └── run_import_history.py  # CLI importación histórica
+├── docs/                      # Documentación detallada
+│   ├── ARCHITECTURE.md
+│   ├── API.md
+│   ├── CONFIGURATION.md
+│   └── DEPLOYMENT.md
+├── Dockerfile                 # Multi-stage build (3.12-slim, non-root)
+├── docker-compose.yml         # 3 services (app, import, import_history)
+├── VERSION                    # 1.1.5
 └── requirements.txt
+```
+
+## SDD (Spec-Driven Development)
+
+Este proyecto usa [Spec-Driven Development](https://github.com/github/spec-kit) para gestionar features. La documentación vive en `.specify/`:
+
+```
+.specify/
+├── memory/constitution.md          # Principios del proyecto
+└── features/existing/              # Features documentados
+    ├── 001-base-import/            # specify.md + plan.md (core)
+    ├── 002-history-import/         # specify.md + plan.md (core)
+    ├── 004-rest-api/               # specify.md + plan.md (core)
+    └── 003,005,006-*/              # specify.md (baseline)
+```
+
+Para agregar un nuevo feature:
+```
+/speckit.specify   -> Definir requisitos
+/speckit.plan      -> Plan técnico
+/speckit.tasks     -> Desglose de tareas
+/speckit.implement -> Implementar
 ```
 
 ## Actualización mensual
 
-FIDE publica datos el último día de cada mes. Para actualizar automáticamente, configura un cron:
+FIDE publica datos el último día de cada mes. Cron recomendado:
 
 ```cron
 0 2 1 * * cd /ruta/al/repo && docker compose --profile fide-import run --rm fide-import
 ```
 
-## Documentación
+## Despliegue
+
+Imagen: `jhonybenitez/squareone-fide-scraper:{version}` (tag desde `VERSION`)
+
+Los datos van a la **misma PostgreSQL que el backend** (base `clubsync`, esquema `fide`).
+
+## Documentación adicional
 
 | Documento | Descripción |
 |-----------|-------------|
