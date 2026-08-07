@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -14,6 +14,7 @@ from src.downloader import extracted_xml_tempfile
 from src.exporter import export_to_csv, export_to_json
 from src.models import Player
 from src.parser import parse_players_xml_path
+from src.services.club_affiliates import load_affiliated_fideids
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,23 @@ def _player_matches_country(player: dict, country_codes: frozenset[str] | None) 
     return (player.get("country") or "").strip().upper() in country_codes
 
 
+def _player_matches_scope(
+    player: dict,
+    country_codes: frozenset[str] | None,
+    include_club_affiliates: bool,
+    affiliated_fideids: frozenset[int],
+) -> bool:
+    if _player_matches_country(player, country_codes):
+        return True
+    if include_club_affiliates:
+        try:
+            fideid = int(player.get("fideid", 0))
+        except (TypeError, ValueError):
+            return False
+        return fideid in affiliated_fideids
+    return False
+
+
 def _batched(iterator: Iterator[dict], size: int) -> Iterator[list[dict]]:
     """Agrupa un iterador en batches del tamaño indicado."""
     batch: list[dict] = []
@@ -103,6 +121,7 @@ def run_import(
     export_csv: bool = True,
     fide_ids: frozenset[int] | None = None,
     country_codes: frozenset[str] | None = None,
+    include_club_affiliates: bool = False,
 ) -> dict:
     """
     Ejecuta el pipeline completo: descarga -> parse -> DB -> export.
@@ -112,19 +131,25 @@ def run_import(
         export_json: Si True, exporta a JSON.
         export_csv: Si True, exporta a CSV.
         fide_ids: Si se define, solo se hace upsert de estos FIDE ID (el XML completo se sigue
-            parseando en streaming; útil para API / import puntual).
+            parseando en streaming; útil para API / import puntual). Ignora country_codes /
+            include_club_affiliates.
         country_codes: Si se define (p. ej. ``frozenset({"PAR"})``), solo se persisten esas
             federaciones FIDE. El XML completo se sigue parseando en streaming.
+        include_club_affiliates: Incluye también jugadores con club asignado en la tabla local
+            ``player`` aunque su federación no esté en ``country_codes`` (extranjeros afiliados a
+            un club paraguayo). Ignorado si ``fide_ids`` no está vacío.
 
     Returns:
         Diccionario con estadísticas: total_imported, total_parsed_rows, json_path, csv_path.
     """
     codes = None if fide_ids else _normalize_country_codes(country_codes)
+    include_club = False if fide_ids else include_club_affiliates
     logger.info(
-        "Iniciando importación FIDE (period=%s, fide_ids=%s, countries=%s)",
+        "Iniciando importación FIDE (period=%s, fide_ids=%s, countries=%s, include_club_affiliates=%s)",
         period,
         f"solo {len(fide_ids)} id(s)" if fide_ids else "todos",
         sorted(codes) if codes else "todas",
+        include_club,
     )
 
     engine = get_engine()
@@ -132,14 +157,23 @@ def run_import(
 
     parsed_rows = 0
     upserted = 0
-    with extracted_xml_tempfile(period=period) as xml_path:
-        with get_db_session() as session:
+    with get_db_session() as session:
+        affiliated_fideids: frozenset[int] = frozenset()
+        if include_club:
+            affiliated_fideids = load_affiliated_fideids(session)
+            logger.info("Jugadores afiliados a club detectados: %d", len(affiliated_fideids))
+
+        with extracted_xml_tempfile(period=period) as xml_path:
             for batch in _batched(parse_players_xml_path(xml_path), BATCH_SIZE):
                 parsed_rows += len(batch)
                 if fide_ids:
                     batch = [p for p in batch if int(p.get("fideid", 0)) in fide_ids]
-                elif codes:
-                    batch = [p for p in batch if _player_matches_country(p, codes)]
+                elif codes or include_club:
+                    batch = [
+                        p
+                        for p in batch
+                        if _player_matches_scope(p, codes, include_club, affiliated_fideids)
+                    ]
                 if not batch:
                     continue
                 _batch_upsert(session, batch)
@@ -155,6 +189,7 @@ def run_import(
         "fide_ids_mode": bool(fide_ids),
         "fide_id_count": len(fide_ids) if fide_ids else None,
         "country_codes": sorted(codes) if codes else None,
+        "include_club_affiliates": include_club,
     }
 
     # Exportar solo los jugadores solicitados si hay filtro; si no, primeros EXPORT_LIMIT.
@@ -163,15 +198,17 @@ def run_import(
             if fide_ids:
                 ids_list = list(fide_ids)
                 stmt = select(Player).where(Player.fideid.in_(ids_list))
-            elif codes:
-                stmt = (
-                    select(Player)
-                    .where(func.upper(Player.country).in_(codes))
-                    .limit(EXPORT_LIMIT)
-                )
+            elif codes or include_club:
+                conditions = []
+                if codes:
+                    conditions.append(func.upper(Player.country).in_(codes))
+                if include_club and affiliated_fideids:
+                    conditions.append(Player.fideid.in_(list(affiliated_fideids)))
+                # Sin condiciones reales (p. ej. include_club sin afiliados detectados): no exportar nada.
+                stmt = select(Player).where(or_(*conditions)).limit(EXPORT_LIMIT) if conditions else None
             else:
                 stmt = select(Player).limit(EXPORT_LIMIT)
-            players = [p.to_dict() for p in session.scalars(stmt).all()]
+            players = [p.to_dict() for p in session.scalars(stmt).all()] if stmt is not None else []
             if players:
                 if export_json:
                     result["json_path"] = str(export_to_json(players))

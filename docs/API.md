@@ -82,6 +82,8 @@ Body:
 {
   "months": 24,
   "period_scope": "rolling_months",
+  "period": null,
+  "use_current_files": false,
   "countries": ["PAR"],
   "include_club_affiliates": false,
   "skip_completed": false
@@ -89,12 +91,41 @@ Body:
 ```
 
 - `period_scope`: `rolling_months` (usa `months`) o `current_year` (enero → mes actual del año en curso).
+- `period`: opcional; fecha YYYY-MM-DD (obligatoriamente primer día del mes). Si se proporciona, solo se importa ese período y `months`/`period_scope` se ignoran.
+- `use_current_files`: solo válido si se proporciona `period`. Si es `true`, descarga los ZIP XML actuales (`standard_rating_list_xml.zip`, `rapid_rating_list_xml.zip`, `blitz_rating_list_xml.zip`) y los persiste como el período indicado. Útil cuando FIDE publica anticipadamente la lista del mes siguiente.
 - `countries`: opcional; lista de códigos FIDE (ej. solo Paraguay: `["PAR"]`). Sin el campo se importan todas las federaciones.
 - `include_club_affiliates`: si es `true`, también incluye jugadores con club asignado (OR con `countries`).
 - `skip_completed`: si es `true`, no vuelve a descargar/parsear periodos ya registrados en `fide.history_import_checkpoint` **para la misma clave de filtro** (`countries`/club o hash de `fide_ids`).
 - `fide_ids`: opcional; lista de FIDE ID enteros (máx. 50000). Si se envía no vacía, **solo** se persisten esos jugadores; **no** debe combinarse con `countries` ni `include_club_affiliates` (la API devuelve error de validación). La clave de checkpoint es estable (`fides:<sha256>` del conjunto ordenado), así que el mismo listado + `skip_completed: true` reanuda sin repetir periodos ya hechos.
 
-Ejemplo solo listado FIDE:
+**Validaciones:**
+- `period` debe ser el primer día del mes (YYYY-MM-01). Si no, devuelve error 422.
+- `use_current_files: true` requiere `period`. Si no, devuelve error 422.
+
+**Ejemplo: importar snapshot de julio 2026 usando archivos actuales (publicados anticipadamente el 29/06/2026):**
+
+```json
+{
+  "period": "2026-07-01",
+  "use_current_files": true,
+  "countries": ["PAR"],
+  "include_club_affiliates": true,
+  "skip_completed": false
+}
+```
+
+**Ejemplo: importar un período histórico específico (junio 2026) desde el archivo FIDE:**
+
+```json
+{
+  "period": "2026-06-01",
+  "use_current_files": false,
+  "countries": ["PAR"],
+  "skip_completed": false
+}
+```
+
+**Ejemplo solo listado FIDE:**
 
 ```json
 {
@@ -106,6 +137,8 @@ Ejemplo solo listado FIDE:
 ```
 
 **Recuperación tras borrar filas en `player_rating_history` o fallos parciales:** el checkpoint puede seguir marcando el periodo como completo. Opciones: ejecutar con `skip_completed: false` para forzar reproceso (los upserts repueblan huecos), o borrar las filas correspondientes en `fide.history_import_checkpoint` para ese `filter_key` (ver campo `filter_key` en la respuesta del job) y volver a lanzar con `skip_completed: true`.
+
+**Nota sobre caches de consultas:** `latest-rating-snapshot` puede tardar hasta 30 minutos en reflejar nuevos snapshots, agregados 15 minutos e históricos hasta 60 minutos.
 
 Respuesta (`202 Accepted`): igual formato que `/admin/import`, con `"type": "import-history"`.
 

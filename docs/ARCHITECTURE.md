@@ -116,8 +116,29 @@ fide-Scraper/
 | `birthday` | int | Año de nacimiento |
 | `flag` | str | Inactividad (I, WI, w) |
 
-## Frecuencia de actualización FIDE
+## Frecuencia de actualización FIDE y estrategia de almacenamiento
 
-- **Publicación**: último día de cada mes
-- **Vigencia**: desde el primer día del mes siguiente
-- **Recomendación**: ejecutar import el día 1 de cada mes
+FIDE publica el listado combinado el último día de cada mes, pero los ZIP *actuales* de
+standard/rapid/blitz (`get_current_xml_zip_urls`) reflejan cambios con más frecuencia que eso.
+Para aprovecharlo sin que `fide.player_rating_history` crezca sin control, conviven dos
+mecanismos de escritura sobre la misma tabla:
+
+| Mecanismo | Cadencia | Qué escribe | Para qué sirve |
+|---|---|---|---|
+| Backfill mensual (`run_import_history`, `_month_periods`/`current_year`) | 1 vez al mes | Snapshot **denso**: una fila por jugador por mes calendario | Selector de "ver el ranking de tal mes" (histórico) |
+| Sincronización diaria (`run_daily_change_sync`) | Diaria (o la que se configure) | **Solo** las filas cuyo rating cambió desde la última corrida — incluida la baja explícita a NULL de una modalidad que deja de figurar | "Subidas del mes", "Nuevos rankeados", posición vigente, Trayectoria |
+
+La sincronización diaria trata la tabla como un **log de cambios** (slowly-changing-dimension),
+no como una foto completa por corrida: compara, jugador por jugador, el valor entrante contra el
+último conocido (`DISTINCT ON (fideid) ... ORDER BY period DESC`) y solo persiste donde hay una
+diferencia real. Esto la hace correr todos los días sin generar una fila por jugador por día — el
+volumen queda acotado a cambios de Elo reales, no a la cadencia de ejecución — y sin romper el
+snapshot mensual, que sigue siendo la fuente para navegar meses históricos.
+
+Las lecturas de "vigente" en `PublicResource` (gainers, nuevos rankeados) resuelven el valor de
+cada jugador con el mismo patrón **as-of** (último valor conocido hasta una fecha de corte), en
+vez de comparar contra el vecino inmediato en la tabla — así el resultado es correcto sea cual
+sea la mezcla de filas densas (mensuales) y dispersas (diarias) que haya entre medio.
+
+- **Recomendación**: `fide-import` + `fide-import-history` el día 1 de cada mes; `fide-daily-sync`
+  todos los días (ver [DEPLOYMENT.md](DEPLOYMENT.md#actualización-snapshot-mensual--sincronización-diaria)).

@@ -5,14 +5,14 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.importer import run_import
-from src.importer_history import run_import_history
+from src.importer_history import run_daily_change_sync, run_import_history
 from src.importer_modal_flags import run_import_modality_flags
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,11 @@ class ImportRequest(BaseModel):
     countries: Optional[list[str]] = Field(
         default=None,
         description="Códigos federación FIDE (ej. PAR); solo esos jugadores se persisten en fide.players",
+    )
+    include_club_affiliates: bool = Field(
+        default=False,
+        description="Incluye también jugadores con club asignado en la tabla local `player` (OR con "
+        "countries), ej. extranjeros afiliados a un club paraguayo",
     )
     fide_ids: Optional[list[int]] = Field(
         default=None,
@@ -65,8 +70,11 @@ class ImportRequest(BaseModel):
 
     @model_validator(mode="after")
     def _exclusive_fide_list_mode(self):
-        if self.fide_ids and self.countries:
-            raise ValueError("No combinar fide_ids con countries")
+        if self.fide_ids:
+            if self.countries:
+                raise ValueError("No combinar fide_ids con countries")
+            if self.include_club_affiliates:
+                raise ValueError("No combinar fide_ids con include_club_affiliates")
         return self
 
 
@@ -87,6 +95,14 @@ class ImportHistoryRequest(BaseModel):
         default="rolling_months",
         description="current_year = solo meses del año calendario en curso",
     )
+    period: Optional[str] = Field(
+        default=None,
+        description="Fecha YYYY-MM-DD (obligatoriamente primer día del mes). Si se proporciona, solo se importa ese período.",
+    )
+    use_current_files: bool = Field(
+        default=False,
+        description="Solo válido si se proporciona period. Usa los ZIP actuales (standard/rapid/blitz_rating_list_xml.zip).",
+    )
     countries: Optional[list[str]] = Field(
         default=None,
         description="Códigos federación FIDE (ej. PAR); solo esos jugadores se persisten",
@@ -98,6 +114,73 @@ class ImportHistoryRequest(BaseModel):
     skip_completed: bool = Field(
         default=False,
         description="Omitir periodos ya en fide.history_import_checkpoint",
+    )
+    fide_ids: Optional[list[int]] = Field(
+        default=None,
+        max_length=_MAX_FIDE_IDS_PER_REQUEST,
+        description="Solo estos FIDE ID (excluye countries / include_club_affiliates)",
+    )
+
+    @field_validator("fide_ids", mode="before")
+    @classmethod
+    def _empty_fide_ids_to_none(cls, v):
+        if v == []:
+            return None
+        return v
+
+    @field_validator("fide_ids")
+    @classmethod
+    def _fide_ids_positive(cls, v: Optional[list[int]]) -> Optional[list[int]]:
+        if v is None:
+            return None
+        for x in v:
+            if x is None or int(x) <= 0:
+                raise ValueError("fide_ids debe contener enteros positivos")
+        return v
+
+    @model_validator(mode="after")
+    def _period_must_be_first_day(self):
+        if self.period is not None:
+            try:
+                parsed = date.fromisoformat(self.period)
+                if parsed.day != 1:
+                    raise ValueError("period debe ser el primer día del mes (YYYY-MM-01)")
+            except ValueError as e:
+                if "YYYY-MM-01" in str(e):
+                    raise
+                raise ValueError("period debe tener formato YYYY-MM-DD") from e
+        return self
+
+    @model_validator(mode="after")
+    def _use_current_requires_period(self):
+        if self.use_current_files and not self.period:
+            raise ValueError("use_current_files=true requiere period")
+        return self
+
+    @model_validator(mode="after")
+    def _exclusive_fide_list_mode(self):
+        if self.fide_ids:
+            if self.countries:
+                raise ValueError("No combinar fide_ids con countries")
+            if self.include_club_affiliates:
+                raise ValueError("No combinar fide_ids con include_club_affiliates")
+        return self
+
+
+class DailySyncRequest(BaseModel):
+    """Parámetros para la sincronización diaria basada en cambios (`fide.player_rating_history`)."""
+
+    period: Optional[str] = Field(
+        default=None,
+        description="Fecha YYYY-MM-DD a usar como period de las filas de cambio (default: hoy)",
+    )
+    countries: Optional[list[str]] = Field(
+        default=None,
+        description="Códigos federación FIDE (ej. PAR); solo esos jugadores se evalúan/persisten",
+    )
+    include_club_affiliates: bool = Field(
+        default=False,
+        description="Incluye también jugadores con club asignado (OR con countries)",
     )
     fide_ids: Optional[list[int]] = Field(
         default=None,
@@ -202,6 +285,7 @@ def _run_job(job_id: str) -> None:
                 export_csv=bool(req.get("export_csv", True)),
                 fide_ids=fid_catalog,
                 country_codes=codes,
+                include_club_affiliates=bool(req.get("include_club_affiliates", False)),
             )
         elif job["type"] == "import-history":
             req = job["request"]
@@ -224,10 +308,29 @@ def _run_job(job_id: str) -> None:
                 include_club_affiliates=bool(req.get("include_club_affiliates", False)),
                 skip_completed=bool(req.get("skip_completed", False)),
                 fide_ids=fid,
+                explicit_period=req.get("period"),
+                use_current_files=bool(req.get("use_current_files", False)),
             )
         elif job["type"] == "import-modality-flags":
             req = job["request"]
             result = run_import_modality_flags(period=req.get("period"))
+        elif job["type"] == "daily-change-sync":
+            req = job["request"]
+            raw_fide = req.get("fide_ids")
+            fid: frozenset[int] | None = None
+            if raw_fide:
+                fid = frozenset(int(x) for x in raw_fide if x is not None)
+            raw_countries = req.get("countries")
+            codes = None
+            if raw_countries and not fid:
+                codes = frozenset(str(c).strip().upper() for c in raw_countries if str(c).strip())
+            req_period = req.get("period")
+            result = run_daily_change_sync(
+                country_codes=codes,
+                include_club_affiliates=bool(req.get("include_club_affiliates", False)),
+                fide_ids=fid,
+                period=date.fromisoformat(req_period) if req_period else None,
+            )
         else:
             raise RuntimeError(f"Tipo de job no soportado: {job['type']}")
 
@@ -257,6 +360,7 @@ def trigger_import(payload: ImportRequest, background_tasks: BackgroundTasks):
             "export_json": payload.export_json,
             "export_csv": payload.export_csv,
             "countries": payload.countries,
+            "include_club_affiliates": payload.include_club_affiliates,
             "fide_ids": payload.fide_ids,
         },
     )
@@ -272,6 +376,8 @@ def trigger_import_history(payload: ImportHistoryRequest, background_tasks: Back
         payload={
             "months": payload.months,
             "period_scope": payload.period_scope,
+            "period": payload.period,
+            "use_current_files": payload.use_current_files,
             "countries": payload.countries,
             "include_club_affiliates": payload.include_club_affiliates,
             "skip_completed": payload.skip_completed,
@@ -289,6 +395,22 @@ def trigger_import_modality_flags(payload: ImportModalityFlagsRequest, backgroun
     job = _queue_job(
         job_type="import-modality-flags",
         payload={"period": payload.period},
+    )
+    background_tasks.add_task(_run_job, job["job_id"])
+    return _job_view(job)
+
+
+@admin_router.post("/sync-daily", response_model=dict, status_code=status.HTTP_202_ACCEPTED)
+def trigger_daily_sync(payload: DailySyncRequest, background_tasks: BackgroundTasks):
+    """Dispara la sincronización diaria basada en cambios de `fide.player_rating_history` en background."""
+    job = _queue_job(
+        job_type="daily-change-sync",
+        payload={
+            "period": payload.period,
+            "countries": payload.countries,
+            "include_club_affiliates": payload.include_club_affiliates,
+            "fide_ids": payload.fide_ids,
+        },
     )
     background_tasks.add_task(_run_job, job["job_id"])
     return _job_view(job)

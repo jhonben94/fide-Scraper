@@ -92,19 +92,52 @@ DATABASE_URL=postgresql://usuario:contraseña_segura@postgres:5432/clubsync
 - **postgres_data** (compose raíz / deploy): datos PostgreSQL
 - **fide_exports** / **exports**: exportaciones JSON/CSV del scraper
 
-### Actualización mensual
+### Actualización: snapshot mensual + sincronización diaria
 
-FIDE publica datos el último día de cada mes. Configura un cron para ejecutar el import el día 1:
+Tres jobs con roles distintos, pensados para correr juntos, no uno en reemplazo del otro:
+
+- **Catálogo vigente diario** (`fide-import`): alimenta `fide.players` — nombre, título, rating
+  actual. Es lo que sostiene el **ranking en vivo** (la vista por defecto, sin `asOf`) y la ficha
+  de jugador. Corré esto **todos los días**: si solo corre el mes 1, el ranking en vivo queda
+  desactualizado el resto del mes aunque el historial (abajo) esté al día.
+- **Sincronización diaria de historial** (`fide-daily-sync`): descarga los ZIP *actuales* de FIDE
+  y solo escribe en `fide.player_rating_history` las filas donde el rating realmente cambió desde
+  la última corrida (incluida la baja explícita a NULL si un jugador deja de figurar en una
+  modalidad). No genera una fila por jugador por día — el volumen queda acotado a cambios
+  reales — y es lo que mantiene frescos "Subidas del mes", "Nuevos rankeados" y el gráfico de
+  Trayectoria. Corré esto todos los días también.
+- **Snapshot mensual denso** (`fide-import-history`, sin `use_current_files`): deja una fila por
+  jugador por calendario-mes en `fide.player_rating_history` — es lo que sostiene el selector de
+  "ver el ranking de tal mes" en el sitio público. Esto sí alcanza con **una vez al mes**: no
+  compite con el daily-sync (conviven en la misma tabla, ver
+  [ARCHITECTURE.md](ARCHITECTURE.md#frecuencia-de-actualización-fide-y-estrategia-de-almacenamiento)).
 
 ```cron
-0 2 1 * * cd /ruta/al/repo && docker compose --profile fide-import run --rm fide-import
+# Catálogo vigente (fide.players) + sincronización de historial — todos los días
+0 3 * * * cd /ruta/al/repo && docker compose --profile fide-import run --rm fide-import
+0 4 * * * cd /ruta/al/repo && docker compose --profile fide-daily-sync run --rm fide-daily-sync
+
+# Snapshot mensual denso (selector de mes histórico) — día 1
+0 2 1 * * cd /ruta/al/repo && docker compose --profile fide-import-history run --rm fide-import-history
 ```
 
 O desde `fide-Scraper/` (con Postgres del compose raíz ya en marcha):
 
 ```cron
-0 2 1 * * cd /ruta/al/repo/fide-Scraper && docker compose --profile fide-import run --rm import
+0 3 * * * cd /ruta/al/repo/fide-Scraper && docker compose --profile fide-import run --rm import
+0 4 * * * cd /ruta/al/repo/fide-Scraper && docker compose --profile fide-daily-sync run --rm fide-daily-sync
+0 2 1 * * cd /ruta/al/repo/fide-Scraper && docker compose --profile fide-import-history run --rm fide-import-history
 ```
+
+Sin acceso al host (solo la URL pública del scraper desplegado), el equivalente vía API son
+[`scripts/trigger_daily_import_remote.sh`](../scripts/trigger_daily_import_remote.sh) y
+[`scripts/trigger_daily_sync_remote.sh`](../scripts/trigger_daily_sync_remote.sh) — mismo par,
+pensados para pegar en un scheduler externo (Coolify/Dokploy "Create Schedule", Jenkins, cron).
+
+Si un día se salta alguno de los crons diarios, no pasa nada grave: `fide-daily-sync` no depende
+de "el día anterior" sino del último valor conocido en la base, así que la corrida siguiente
+captura igual todos los cambios acumulados; `fide-import` simplemente deja el catálogo un día más
+desactualizado hasta la próxima corrida (upsert, sin pérdida de datos).
 
 ### Trigger remoto desde Jenkins (sin `docker compose run`)
 
@@ -128,6 +161,12 @@ curl -sS -X POST "https://tu-scraper/admin/import-history" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: ${FIDE_SCRAPER_API_KEY}" \
   -d '{"months": 12, "period_scope": "rolling_months", "skip_completed": true, "fide_ids": [123456, 789012]}'
+
+# Sincronización diaria basada en cambios
+curl -sS -X POST "https://tu-scraper/admin/sync-daily" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${FIDE_SCRAPER_API_KEY}" \
+  -d '{"countries": ["PAR"]}'
 ```
 
 **skip_completed vs reproceso:** si `skip_completed` está activo y el checkpoint marca un periodo como listo pero faltan filas (borrado manual o error parcial), ejecutá el job con `skip_completed: false` o borrá las filas correspondientes en `fide.history_import_checkpoint` antes de relanzar.

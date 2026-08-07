@@ -13,9 +13,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from src.database import get_db_session, get_engine, init_db
-from src.downloader import discover_period_archive_xml_zip_urls, extracted_xml_from_zip_url
+from src.downloader import discover_period_archive_xml_zip_urls, extracted_xml_from_zip_url, get_current_xml_zip_urls
 from src.models import HistoryImportCheckpoint, PlayerRatingHistory
 from src.parser import parse_players_xml_path
+from src.services.club_affiliates import load_affiliated_fideids
 
 logger = logging.getLogger(__name__)
 
@@ -168,22 +169,6 @@ def _build_filter_key(
     return _history_filter_key(codes, include_club_affiliates)
 
 
-def _load_affiliated_fideids(session: Session) -> frozenset[int]:
-    """Obtiene FIDE IDs de jugadores con club asignado en la base principal."""
-    rows = session.execute(
-        text(
-            """
-            SELECT DISTINCT CAST(p.fide_id AS INTEGER) AS fideid
-            FROM player p
-            WHERE p.current_club_id IS NOT NULL
-              AND p.fide_id IS NOT NULL
-              AND p.fide_id ~ '^[0-9]+$'
-            """
-        )
-    )
-    return frozenset(int(r[0]) for r in rows)
-
-
 def _completed_periods(session: Session, period_scope: str, filter_key: str) -> set[date]:
     stmt = select(HistoryImportCheckpoint.period).where(
         HistoryImportCheckpoint.period_scope == period_scope,
@@ -230,6 +215,8 @@ def run_import_history(
     include_club_affiliates: bool = False,
     skip_completed: bool = False,
     fide_ids: frozenset[int] | None = None,
+    explicit_period: str | None = None,
+    use_current_files: bool = False,
 ) -> dict:
     """
     Importa historial de ratings.
@@ -247,17 +234,35 @@ def run_import_history(
         skip_completed: Si es True, omite periodos ya registrados en ``fide.history_import_checkpoint``.
         fide_ids: Si se define y no está vacío, solo se persisten estos FIDE ID (clave de checkpoint por hash
             estable del conjunto ordenado).
+        explicit_period: Si se define (YYYY-MM-DD, primer día del mes), solo se importa ese período.
+            Cuando se proporciona, ``months`` y ``period_scope`` se ignoran.
+        use_current_files: Solo válido con ``explicit_period``. Si es True, descarga los tres ZIP actuales
+            (standard_rating_list_xml.zip, rapid_rating_list_xml.zip, blitz_rating_list_xml.zip) y los
+            persiste como el período indicado. Si es False, resuelve los ZIP históricos desde el archivo FIDE.
 
     Returns:
         dict con total_periods, total_records (upserts), total_rows_parsed, periods_imported,
-        period_scope, country_codes, periods_skipped (opcional), fide_ids_mode, fide_id_count, filter_key.
+        period_scope, country_codes, periods_skipped (opcional), fide_ids_mode, fide_id_count, filter_key,
+        source (indica "current_files" o "archive").
     """
     fid = _normalize_fide_ids(fide_ids)
     codes = None if fid else _normalize_country_codes(country_codes)
     include_club = False if fid else include_club_affiliates
     filter_key = _build_filter_key(codes, include_club, fid)
-    if period_scope == "current_year":
+
+    explicit_period_obj: date | None = None
+    if explicit_period:
+        from datetime import date as date_cls
+        explicit_period_obj = date_cls.fromisoformat(explicit_period)
+        source: str = "current_files" if use_current_files else "archive"
+        logger.info(
+            "Importación explícita de periodo %s (source=%s)",
+            explicit_period,
+            source,
+        )
+    elif period_scope == "current_year":
         periods = _periods_current_year()
+        source = "archive"
         logger.info(
             "Iniciando importación de historial (año en curso: %d periodos, año %d)",
             len(periods),
@@ -265,6 +270,7 @@ def run_import_history(
         )
     else:
         periods = _month_periods(months)
+        source = "archive"
         logger.info("Iniciando importación de historial (%d meses, rolling)", months)
     if fid:
         logger.info("Modo listado FIDE ID: %d identidades (filter_key=%s)", len(fid), filter_key)
@@ -274,7 +280,13 @@ def run_import_history(
         if include_club:
             logger.info("Filtro adicional habilitado: jugadores afiliados a club")
 
-    periods_planned = list(periods)
+    if explicit_period_obj:
+        periods_planned = [explicit_period_obj]
+        working_scope = "explicit"
+    else:
+        periods_planned = list(periods)
+        working_scope = period_scope
+
     engine = get_engine()
     init_db(engine)
 
@@ -285,19 +297,19 @@ def run_import_history(
     with get_db_session() as session:
         affiliated_fideids: frozenset[int] = frozenset()
         if include_club and not fid:
-            affiliated_fideids = _load_affiliated_fideids(session)
+            affiliated_fideids = load_affiliated_fideids(session)
             logger.info("Jugadores afiliados a club detectados: %d", len(affiliated_fideids))
 
         working = list(periods_planned)
         if skip_completed:
-            done = _completed_periods(session, period_scope, filter_key)
+            done = _completed_periods(session, working_scope, filter_key)
             periods_skipped = [p.strftime("%Y-%m-%d") for p in working if p in done]
             working = [p for p in working if p not in done]
             if periods_skipped:
                 logger.info(
                     "Omitiendo %d periodo(s) ya en history_import_checkpoint (%s / %s): %s",
                     len(periods_skipped),
-                    period_scope,
+                    working_scope,
                     filter_key or "(sin filtro país)",
                     ", ".join(periods_skipped),
                 )
@@ -307,7 +319,10 @@ def run_import_history(
             period_parsed = 0
             period_upserted = 0
             try:
-                zip_urls = discover_period_archive_xml_zip_urls(period_str)
+                if use_current_files:
+                    zip_urls = get_current_xml_zip_urls()
+                else:
+                    zip_urls = discover_period_archive_xml_zip_urls(period_str)
                 for kind, row_fn in _HISTORY_KIND_ORDER:
                     zip_url = zip_urls[kind]
                     with extracted_xml_from_zip_url(zip_url) as xml_path:
@@ -345,7 +360,7 @@ def run_import_history(
                 _upsert_checkpoint(
                     session,
                     period=period,
-                    period_scope=period_scope,
+                    period_scope=working_scope,
                     filter_key=filter_key,
                     rows_parsed=period_parsed,
                     rows_upserted=period_upserted,
@@ -360,7 +375,209 @@ def run_import_history(
         "total_rows_parsed": total_rows_parsed,
         "periods_imported": [p.strftime("%Y-%m-%d") for p in working],
         "periods_skipped": periods_skipped,
-        "period_scope": period_scope,
+        "period_scope": working_scope,
+        "country_codes": sorted(codes) if codes else None,
+        "include_club_affiliates": include_club,
+        "fide_ids_mode": bool(fid),
+        "fide_id_count": len(fid) if fid else None,
+        "filter_key": filter_key,
+        "source": source,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sincronización diaria basada en cambios (no reemplaza el backfill mensual de arriba,
+# que sigue siendo la fuente de snapshots densos para el selector de mes histórico).
+# ---------------------------------------------------------------------------
+
+_KIND_COLUMN: dict[str, str] = {"standard": "rating", "rapid": "rapid_rating", "blitz": "blitz_rating"}
+
+
+def _batch_upsert_history_full(session: Session, batch: list[dict], period: date) -> int:
+    """Inserta/actualiza filas de cambio ya completas (rating + rapid_rating + blitz_rating).
+
+    A diferencia de `_batch_upsert_history` (pensada para las 3 pasadas STD/RPD/BLZ de un mismo
+    período histórico, donde cada pasada trae una sola modalidad y el COALESCE evita que una
+    pasada pise las otras dos), cada fila que llega acá ya representa el estado completo del
+    jugador para hoy: si una modalidad pasó a NULL (dejó de figurar, p. ej. por inactividad),
+    tiene que quedar NULL de verdad, no conservar el valor anterior.
+    """
+    if not batch:
+        return 0
+    stmt = pg_insert(PlayerRatingHistory).values(
+        [
+            {
+                "fideid": p["fideid"],
+                "period": period,
+                "rating": p.get("rating"),
+                "rapid_rating": p.get("rapid_rating"),
+                "blitz_rating": p.get("blitz_rating"),
+            }
+            for p in batch
+        ]
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["fideid", "period"],
+        set_={
+            "rating": stmt.excluded.rating,
+            "rapid_rating": stmt.excluded.rapid_rating,
+            "blitz_rating": stmt.excluded.blitz_rating,
+        },
+    )
+    session.execute(stmt)
+    return len(batch)
+
+
+def _load_tracked_fideids(session: Session) -> set[int]:
+    """FIDE IDs con al menos una fila ya existente en player_rating_history.
+
+    Sirve para detectar jugadores que desaparecen por completo de las tres listas actuales
+    (no solo de una modalidad) y que por lo tanto necesitan una baja explícita.
+    """
+    rows = session.execute(text("SELECT DISTINCT fideid FROM fide.player_rating_history"))
+    return {int(r[0]) for r in rows}
+
+
+def _load_last_known_ratings(
+    session: Session, fideids: set[int]
+) -> dict[int, tuple[Optional[int], Optional[int], Optional[int]]]:
+    """Último valor conocido (rating, rapid_rating, blitz_rating) por fideid, sin importar el período."""
+    if not fideids:
+        return {}
+    rows = session.execute(
+        text(
+            """
+            SELECT DISTINCT ON (fideid) fideid, rating, rapid_rating, blitz_rating
+            FROM fide.player_rating_history
+            WHERE fideid = ANY(:ids)
+            ORDER BY fideid, period DESC
+            """
+        ),
+        {"ids": list(fideids)},
+    )
+    return {int(r[0]): (r[1], r[2], r[3]) for r in rows}
+
+
+def run_daily_change_sync(
+    *,
+    country_codes: frozenset[str] | None = None,
+    include_club_affiliates: bool = False,
+    fide_ids: frozenset[int] | None = None,
+    period: Optional[date] = None,
+) -> dict:
+    """
+    Sincronización diaria basada en cambios.
+
+    Descarga los tres ZIP *actuales* de FIDE (standard/rapid/blitz) y compara, jugador por
+    jugador, el rating resultante contra el último valor conocido en `player_rating_history`.
+    Solo se escribe una fila nueva (period = hoy, o el que se indique) cuando al menos una
+    modalidad cambió respecto a lo último guardado —incluida la baja explícita a NULL cuando un
+    jugador deja de figurar en una modalidad (inactividad) o en las tres (desaparece de FIDE)—,
+    o cuando el jugador es nuevo. A diferencia de `run_import_history`, correr esto todos los
+    días no genera una fila por jugador por día: el volumen queda acotado a cambios reales, sin
+    importar cuántas veces se ejecute ni la cadencia real de publicación de FIDE.
+
+    No reemplaza el backfill mensual (`period_scope=rolling_months|current_year` arriba): ese
+    sigue siendo la fuente de snapshots densos mes a mes para el selector de mes histórico. Este
+    job alimenta "vigente ahora" (gainers, nuevos rankeados, progreso) con datos frescos.
+
+    Args:
+        country_codes / include_club_affiliates / fide_ids: mismo significado que en
+            `run_import_history`.
+        period: fecha a usar como `period` de las filas de cambio (por defecto, hoy).
+
+    Returns:
+        dict con period, rows_parsed, players_evaluated, rows_changed y metadata del filtro.
+    """
+    fid = _normalize_fide_ids(fide_ids)
+    codes = None if fid else _normalize_country_codes(country_codes)
+    include_club = False if fid else include_club_affiliates
+    filter_key = _build_filter_key(codes, include_club, fid)
+    run_period = period or date.today()
+
+    logger.info("Iniciando sincronización diaria (period=%s, filter_key=%s)", run_period, filter_key or "(sin filtro)")
+
+    engine = get_engine()
+    init_db(engine)
+
+    values_by_kind: dict[str, dict[int, int]] = {"standard": {}, "rapid": {}, "blitz": {}}
+    total_rows_parsed = 0
+
+    with get_db_session() as session:
+        affiliated_fideids: frozenset[int] = frozenset()
+        if include_club and not fid:
+            affiliated_fideids = load_affiliated_fideids(session)
+
+        zip_urls = get_current_xml_zip_urls()
+        for kind, row_fn in _HISTORY_KIND_ORDER:
+            zip_url = zip_urls[kind]
+            column = _KIND_COLUMN[kind]
+            with extracted_xml_from_zip_url(zip_url) as xml_path:
+                for p in parse_players_xml_path(xml_path):
+                    total_rows_parsed += 1
+                    try:
+                        fideid = int(p.get("fideid", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if not fideid:
+                        continue
+                    if fid:
+                        if fideid not in fid:
+                            continue
+                    elif codes or include_club:
+                        matches = (codes and (p.get("country") or "").strip().upper() in codes) or (
+                            include_club and fideid in affiliated_fideids
+                        )
+                        if not matches:
+                            continue
+                    value = row_fn(p).get(column)
+                    if value is not None:
+                        values_by_kind[kind][fideid] = value
+            logger.info("Pasada %s: %d jugadores relevantes con rating vigente", kind, len(values_by_kind[kind]))
+
+        seen_today = set(values_by_kind["standard"]) | set(values_by_kind["rapid"]) | set(values_by_kind["blitz"])
+        tracked = set(fid) if fid else _load_tracked_fideids(session)
+        relevant_ids = tracked | seen_today
+        last_known = _load_last_known_ratings(session, relevant_ids)
+
+        changed: list[dict] = []
+        for fideid in relevant_ids:
+            new_std = values_by_kind["standard"].get(fideid)
+            new_rpd = values_by_kind["rapid"].get(fideid)
+            new_blz = values_by_kind["blitz"].get(fideid)
+            prev = last_known.get(fideid, (None, None, None))
+            if (new_std, new_rpd, new_blz) == prev:
+                continue
+            changed.append(
+                {"fideid": fideid, "rating": new_std, "rapid_rating": new_rpd, "blitz_rating": new_blz}
+            )
+
+        rows_upserted = 0
+        for batch in _batched(iter(changed), BATCH_SIZE):
+            rows_upserted += _batch_upsert_history_full(session, batch, run_period)
+
+        _upsert_checkpoint(
+            session,
+            period=run_period,
+            period_scope="daily_change_sync",
+            filter_key=filter_key,
+            rows_parsed=total_rows_parsed,
+            rows_upserted=rows_upserted,
+        )
+
+    logger.info(
+        "Sincronización diaria %s: %d filas XML parseadas, %d jugadores evaluados, %d cambios reales persistidos",
+        run_period.isoformat(),
+        total_rows_parsed,
+        len(relevant_ids),
+        rows_upserted,
+    )
+
+    return {
+        "period": run_period.strftime("%Y-%m-%d"),
+        "rows_parsed": total_rows_parsed,
+        "players_evaluated": len(relevant_ids),
+        "rows_changed": rows_upserted,
         "country_codes": sorted(codes) if codes else None,
         "include_club_affiliates": include_club,
         "fide_ids_mode": bool(fid),

@@ -24,6 +24,10 @@ CHUNK = 1024 * 1024
 # `players_list_xml.zip?period=` devuelve el mismo listado actual; no sirve para historial.
 FIDE_ARCHIVE_DOWNLOAD_PAGE = "https://ratings.fide.com/a_download.php"
 
+CURRENT_STANDARD_URL = "https://ratings.fide.com/download/standard_rating_list_xml.zip"
+CURRENT_RAPID_URL = "https://ratings.fide.com/download/rapid_rating_list_xml.zip"
+CURRENT_BLITZ_URL = "https://ratings.fide.com/download/blitz_rating_list_xml.zip"
+
 
 def discover_period_archive_xml_zip_urls(period: str) -> dict[str, str]:
     """
@@ -57,6 +61,20 @@ def discover_period_archive_xml_zip_urls(period: str) -> dict[str, str]:
             f"No se encontraron enlaces XML de archivo para period={period}; faltan: {missing}"
         )
     return {k: found[k] for k in required}
+
+
+def get_current_xml_zip_urls() -> dict[str, str]:
+    """
+    Retorna las URLs de los tres ZIP XML actuales (standard / rapid / blitz).
+
+    Estos archivos corresponden a la lista publicada más recientemente por FIDE,
+    no a un periodo histórico específico.
+    """
+    return {
+        "standard": CURRENT_STANDARD_URL,
+        "rapid": CURRENT_RAPID_URL,
+        "blitz": CURRENT_BLITZ_URL,
+    }
 
 
 def _build_url(period: str | None) -> str:

@@ -39,6 +39,11 @@ def main():
         action="store_true",
         help="No exportar a CSV",
     )
+    parser.add_argument(
+        "--include-club-affiliates",
+        action="store_true",
+        help="Incluye también jugadores con club asignado (OR con --country), ej. extranjeros afiliados a un club local",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
@@ -51,6 +56,9 @@ def main():
         ]
 
     codes = frozenset(countries) if countries else None
+    include_club_affiliates = bool(
+        args.include_club_affiliates or settings.fide_history_include_club_affiliates
+    )
 
     try:
         result = run_import(
@@ -58,6 +66,7 @@ def main():
             export_json=not args.no_json,
             export_csv=not args.no_csv,
             country_codes=codes,
+            include_club_affiliates=include_club_affiliates,
         )
         logger.info("Resultado: %s", result)
     except Exception as e:

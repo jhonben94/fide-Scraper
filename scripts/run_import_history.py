@@ -40,7 +40,7 @@ def main():
         "--months",
         type=int,
         default=24,
-        help="Meses hacia atrás en modo rolling (default: 24). Ignorado con --current-year.",
+        help="Meses hacia atrás en modo rolling (default: 24). Ignorado con --current-year o --period.",
     )
     parser.add_argument(
         "--current-year",
@@ -53,6 +53,18 @@ def main():
         choices=["rolling_months", "current_year"],
         default=None,
         help="Alternativa a --current-year (útil con variables de entorno documentadas)",
+    )
+    parser.add_argument(
+        "--period",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Fecha explícita (primer día del mes). Si se usa con --use-current-files, descarga los ZIP actuales como snapshot del período.",
+    )
+    parser.add_argument(
+        "--use-current-files",
+        action="store_true",
+        help="Solo válido con --period. Usa los ZIP actuales (standard/rapid/blitz_rating_list_xml.zip).",
     )
     parser.add_argument(
         "--country",
@@ -87,6 +99,10 @@ def main():
         help="Archivo con un FIDE ID por línea (# comentarios). Se unen con --fide-id.",
     )
     args = parser.parse_args()
+
+    if args.use_current_files and not args.period:
+        logger.error("--use-current-files requiere --period")
+        sys.exit(1)
 
     settings = get_settings()
 
@@ -131,6 +147,8 @@ def main():
             include_club_affiliates=include_club_affiliates,
             skip_completed=bool(args.skip_completed),
             fide_ids=fid,
+            explicit_period=args.period,
+            use_current_files=bool(args.use_current_files),
         )
         logger.info("Resultado: %s", result)
     except Exception as e:
