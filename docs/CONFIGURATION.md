@@ -6,7 +6,7 @@ Todas las opciones se configuran mediante variables de entorno.
 
 | Variable | Tipo | Default | Descripción |
 |----------|------|---------|-------------|
-| `DATABASE_URL` | str | `postgresql://clubsync:clubsync@localhost:5432/clubsync` | Misma BD que el backend; tablas FIDE en esquema `fide` (Flyway V6) |
+| `DATABASE_URL` | str | `postgresql://clubsync:clubsync@localhost:5435/clubsync` | Misma BD que el backend; tablas FIDE en esquema `fide` (Flyway V6) |
 | `FIDE_XML_URL` | str | `https://ratings.fide.com/download/players_list_xml.zip` | Lista **combinada** STD+RPD+BLZ (misma familia que la web FIDE; ~48 MB) |
 | `FIDE_SCRAPER_API_KEY` | str | *(vacío)* | Si está definida, la API exige el mismo valor en header `X-API-Key` |
 | `FIDE_SCRAPER_ADMIN_ALLOWLIST` | str | *(vacío)* | Allowlist para `/admin/*` (IPs/CIDRs separados por coma). Vacío: solo API key |
@@ -28,7 +28,7 @@ cp .env.example .env
 Ejemplo:
 
 ```env
-DATABASE_URL=postgresql://clubsync:clubsync@localhost:5432/clubsync
+DATABASE_URL=postgresql://clubsync:clubsync@localhost:5435/clubsync
 FIDE_XML_URL=https://ratings.fide.com/download/players_list_xml.zip
 # FIDE_SCRAPER_API_KEY=opcional_para_proteger_la_API
 FIDE_SCRAPER_ADMIN_ALLOWLIST=203.0.113.10/32

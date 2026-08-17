@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from src.database import get_db_session, get_engine, init_db
 from src.downloader import discover_period_archive_xml_zip_urls, extracted_xml_from_zip_url, get_current_xml_zip_urls
-from src.models import HistoryImportCheckpoint, PlayerRatingHistory
+from src.models import HistoryImportCheckpoint, Player, PlayerRatingHistory
 from src.parser import parse_players_xml_path
 from src.services.club_affiliates import load_affiliated_fideids
 
@@ -438,6 +438,14 @@ def _load_tracked_fideids(session: Session) -> set[int]:
     return {int(r[0]) for r in rows}
 
 
+def _load_country_fideids(session: Session, country_codes: frozenset[str]) -> set[int]:
+    """FIDE IDs locales que pertenecen a las federaciones incluidas por el filtro."""
+    if not country_codes:
+        return set()
+    rows = session.execute(select(Player.fideid).where(func.upper(Player.country).in_(country_codes)))
+    return {int(r[0]) for r in rows}
+
+
 def _load_last_known_ratings(
     session: Session, fideids: set[int]
 ) -> dict[int, tuple[Optional[int], Optional[int], Optional[int]]]:
@@ -536,7 +544,13 @@ def run_daily_change_sync(
             logger.info("Pasada %s: %d jugadores relevantes con rating vigente", kind, len(values_by_kind[kind]))
 
         seen_today = set(values_by_kind["standard"]) | set(values_by_kind["rapid"]) | set(values_by_kind["blitz"])
-        tracked = set(fid) if fid else _load_tracked_fideids(session)
+        if fid:
+            tracked = set(fid)
+        else:
+            tracked = _load_tracked_fideids(session)
+            if codes or include_club:
+                country_fideids = _load_country_fideids(session, codes) if codes else set()
+                tracked &= country_fideids | set(affiliated_fideids)
         relevant_ids = tracked | seen_today
         last_known = _load_last_known_ratings(session, relevant_ids)
 

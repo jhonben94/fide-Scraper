@@ -320,10 +320,14 @@ class TestDailyChangeSync:
         with patch("src.importer_history.get_db_session") as mock_db, \
              patch("src.importer_history.get_engine") as mock_engine, \
              patch("src.importer_history.init_db"), \
-             patch(
-                 "src.importer_history._load_tracked_fideids",
-                 return_value={123456, 999999},
-             ), \
+              patch(
+                  "src.importer_history._load_tracked_fideids",
+                  return_value={123456, 999999},
+              ), \
+              patch(
+                  "src.importer_history._load_country_fideids",
+                  return_value={123456, 999999},
+              ), \
              patch(
                  "src.importer_history._load_last_known_ratings",
                  return_value={123456: (2400, 2400, 2400), 999999: (1500, 1500, 1500)},
@@ -345,6 +349,66 @@ class TestDailyChangeSync:
             written = mock_upsert.call_args[0][1]
             assert written == [
                 {"fideid": 999999, "rating": None, "rapid_rating": None, "blitz_rating": None}
+            ]
+
+    def test_filtered_sync_only_nulls_missing_tracked_players_inside_scope(self, mock_downloader):
+        """PAR y afiliados son evaluables; un extranjero no afiliado no debe nulificarse."""
+        par_fideid = 123456
+        affiliated_foreign_fideid = 222222
+        unrelated_foreign_fideid = 333333
+
+        with patch("src.importer_history.get_db_session") as mock_db, \
+             patch("src.importer_history.get_engine") as mock_engine, \
+             patch("src.importer_history.init_db"), \
+             patch(
+                 "src.importer_history.load_affiliated_fideids",
+                 return_value=frozenset({affiliated_foreign_fideid}),
+             ), \
+             patch(
+                 "src.importer_history._load_tracked_fideids",
+                 return_value={par_fideid, affiliated_foreign_fideid, unrelated_foreign_fideid},
+             ), \
+             patch(
+                 "src.importer_history._load_country_fideids",
+                 return_value={par_fideid},
+             ), \
+             patch(
+                 "src.importer_history._load_last_known_ratings",
+                 return_value={
+                     par_fideid: (2400, 2400, 2400),
+                     affiliated_foreign_fideid: (2100, 2050, 2000),
+                     unrelated_foreign_fideid: (1900, 1850, 1800),
+                 },
+             ) as mock_last_known, \
+             patch("src.importer_history._batch_upsert_history_full") as mock_upsert, \
+             patch("src.importer_history._upsert_checkpoint"):
+
+            mock_session = MagicMock()
+            mock_engine.return_value = MagicMock()
+            mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_db.return_value.__exit__ = MagicMock(return_value=None)
+            mock_upsert.side_effect = lambda session, batch, period: len(batch)
+
+            from src.importer_history import run_daily_change_sync
+
+            result = run_daily_change_sync(
+                country_codes=frozenset({"PAR"}),
+                include_club_affiliates=True,
+                period=date(2026, 8, 1),
+            )
+
+            assert result["players_evaluated"] == 2
+            assert result["rows_changed"] == 1
+            mock_last_known.assert_called_once_with(
+                mock_session, {par_fideid, affiliated_foreign_fideid}
+            )
+            assert mock_upsert.call_args[0][1] == [
+                {
+                    "fideid": affiliated_foreign_fideid,
+                    "rating": None,
+                    "rapid_rating": None,
+                    "blitz_rating": None,
+                }
             ]
 
     def test_period_defaults_to_today(self, mock_downloader):

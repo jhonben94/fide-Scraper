@@ -10,16 +10,18 @@ from src.config import get_settings
 from src.models import Base
 
 
-def get_engine():
+def get_engine(url: str | None = None):
     """Crea el engine de SQLAlchemy."""
     settings = get_settings()
-    return create_engine(
-        settings.database_url,
-        pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=10,
-        connect_args={"application_name": settings.fide_scraper_pg_application_name},
-    )
+    database_url = url or settings.database_url
+    kwargs = {"pool_pre_ping": True}
+    if not database_url.startswith("sqlite"):
+        kwargs.update(
+            pool_size=5,
+            max_overflow=10,
+            connect_args={"application_name": settings.fide_scraper_pg_application_name},
+        )
+    return create_engine(database_url, **kwargs)
 
 
 def get_session_factory():

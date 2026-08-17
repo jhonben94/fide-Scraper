@@ -29,5 +29,8 @@ RUN mkdir -p /data/exports && chown -R appuser:appuser /data
 
 USER appuser
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=4).read()"]
+
 # Por defecto ejecutar API; para import: docker run ... python -m scripts.run_import
 CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -3,7 +3,8 @@
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
-from sqlalchemy import text
+from fastapi.responses import JSONResponse
+from sqlalchemy import inspect, text
 
 from src.api.admin_routes import admin_router
 from src.api.deps import verify_admin_access, verify_optional_api_key
@@ -48,5 +49,36 @@ app.include_router(admin_router, dependencies=[Depends(verify_admin_access)])
 
 @app.get("/health")
 def health():
-    """Health check para monitoreo."""
+    """Health check legado, equivalente a liveness."""
+    return {"status": "ok"}
+
+
+@app.get("/health/live")
+def health_live():
+    """Confirma que el proceso HTTP está respondiendo."""
+    return {"status": "ok"}
+
+
+@app.get("/health/ready", responses={503: {"description": "Servicio no disponible"}})
+def health_ready():
+    """Comprueba conexión y estructura mínima requerida para servir la API."""
+    engine = None
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1")).scalar_one()
+            inspector = inspect(conn)
+            schema_ready = inspector.has_schema("fide")
+            tables_ready = all(
+                inspector.has_table(table_name, schema="fide")
+                for table_name in ("players", "player_rating_history")
+            )
+        if not schema_ready or not tables_ready:
+            return JSONResponse(status_code=503, content={"status": "not_ready"})
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+    finally:
+        if engine is not None:
+            engine.dispose()
+
     return {"status": "ok"}
